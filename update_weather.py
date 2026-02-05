@@ -2,10 +2,13 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import os
+import sys
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("TOMORROW_API_KEY")
-HISTORY_START_YEAR = 2024 # Keep it shorter for hardcoded arrays (Script Char Limit)
+# Using a shorter history for the text file to fit in Pine's character limit
+HISTORY_START_YEAR = 2024 
+
 LOCATIONS = [
     {"name": "Chicago", "lat": 41.8781, "lon": -87.6298, "weight": 0.35},
     {"name": "New York", "lat": 40.7128, "lon": -74.0060, "weight": 0.30},
@@ -14,68 +17,138 @@ LOCATIONS = [
     {"name": "Atlanta",  "lat": 33.7490", "lon": -84.3880,  "weight": 0.10}
 ]
 
-def fetch_history_and_forecast():
-    # 1. Fetch History (Open-Meteo)
+def fetch_data():
+    print("--- Starting Data Fetch ---")
+    
+    # 1. FETCH HISTORY (Open-Meteo)
     print("Fetching History...")
     end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     start_date = f"{HISTORY_START_YEAR}-01-01"
     
-    history_frames = []
-    for loc in LOCATIONS:
-        url = "https://archive-api.open-meteo.com/v1/archive"
-        params = {"latitude": loc['lat'], "longitude": loc['lon'], "start_date": start_date, "end_date": end_date, "daily": "temperature_2m_mean"}
-        r = requests.get(url, params=params).json()
-        df = pd.DataFrame({'time': r['daily']['time'], 'temp': r['daily']['temperature_2m_mean']})
-        df['weight'] = loc['weight']
-        history_frames.append(df)
+    daily_hist = pd.DataFrame()
     
-    full_hist = pd.concat(history_frames)
-    daily_hist = full_hist.groupby('time').apply(lambda x: (x['temp'] * x['weight']).sum()).reset_index(name='avg_temp')
-
-    # 2. Fetch Forecast (Tomorrow.io)
-    print("Fetching Forecast...")
-    forecast_map = {}
-    if API_KEY:
+    try:
+        hist_frames = []
         for loc in LOCATIONS:
-            url = f"https://api.tomorrow.io/v4/weather/forecast?location={loc['lat']},{loc['lon']}&apikey={API_KEY}"
-            try:
-                data = requests.get(url).json()['timelines']['daily']
-                for d in data:
-                    dt = d['time'].split('T')[0]
-                    val = d['values']['temperatureAvg']
-                    forecast_map[dt] = forecast_map.get(dt, 0) + (val * loc['weight'])
-            except: pass
+            url = "https://archive-api.open-meteo.com/v1/archive"
+            params = {
+                "latitude": loc['lat'], 
+                "longitude": loc['lon'], 
+                "start_date": start_date, 
+                "end_date": end_date, 
+                "daily": "temperature_2m_mean"
+            }
+            # Add timeout to prevent hanging
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
+            
+            if 'daily' in data:
+                df = pd.DataFrame({
+                    'time': data['daily']['time'], # Format is YYYY-MM-DD
+                    'temp': data['daily']['temperature_2m_mean']
+                })
+                df['weight'] = loc['weight']
+                hist_frames.append(df)
+        
+        if hist_frames:
+            full_hist = pd.concat(hist_frames)
+            # Weighted Average Calculation
+            full_hist['weighted_temp'] = full_hist['temp'] * full_hist['weight']
+            daily_hist = full_hist.groupby('time')['weighted_temp'].sum().reset_index()
+            daily_hist.rename(columns={'weighted_temp': 'avg_temp'}, inplace=True)
+            print(f"History fetched: {len(daily_hist)} days.")
+    except Exception as e:
+        print(f"History Fetch Error: {e}")
+
+    # 2. FETCH FORECAST (Tomorrow.io)
+    print("Fetching Forecast...")
+    daily_fore = pd.DataFrame()
     
-    daily_fore = pd.DataFrame(list(forecast_map.items()), columns=['time', 'avg_temp'])
-    
-    # 3. Merge
-    df_final = pd.concat([daily_hist, daily_fore]).drop_duplicates(subset='time', keep='last').sort_values('time')
+    if API_KEY:
+        try:
+            fore_map = {}
+            for loc in LOCATIONS:
+                url = f"https://api.tomorrow.io/v4/weather/forecast?location={loc['lat']},{loc['lon']}&apikey={API_KEY}"
+                r = requests.get(url, headers={"accept": "application/json"}, timeout=10)
+                if r.status_code == 200:
+                    timelines = r.json().get('timelines', {}).get('daily', [])
+                    for day in timelines:
+                        # CRITICAL: Normalize time to YYYY-MM-DD to avoid duplicates
+                        dt = day['time'].split('T')[0]
+                        temp = day['values'].get('temperatureAvg', 0)
+                        
+                        if dt not in fore_map:
+                            fore_map[dt] = 0
+                        fore_map[dt] += (temp * loc['weight'])
+            
+            if fore_map:
+                daily_fore = pd.DataFrame(list(fore_map.items()), columns=['time', 'avg_temp'])
+                print(f"Forecast fetched: {len(daily_fore)} days.")
+        except Exception as e:
+            print(f"Forecast Fetch Error: {e}")
+    else:
+        print("Skipping Forecast (No API Key).")
+
+    # 3. MERGE & CLEAN
+    df_final = pd.DataFrame()
+    if not daily_hist.empty and not daily_fore.empty:
+        df_final = pd.concat([daily_hist, daily_fore])
+    elif not daily_hist.empty:
+        df_final = daily_hist
+    elif not daily_fore.empty:
+        df_final = daily_fore
+
+    if not df_final.empty:
+        # STRICT DEDUPLICATION: Drop duplicates, keeping the last (Forecast overrides History)
+        df_final = df_final.drop_duplicates(subset='time', keep='last')
+        df_final = df_final.sort_values('time')
     
     return df_final
 
-def generate_pine_code(df):
-    # Convert to HDD
-    base_temp = 18.33
+def generate_files(df):
+    if df.empty:
+        print("No data to write.")
+        # Create empty file so Git doesn't fail
+        with open("pine_code.txt", "w") as f: f.write("// No Data Available")
+        return
+
+    # A. Generate CSV (Fixed Format)
+    # We create dummy OHLC columns for the Seed CSV
+    csv_df = df.copy()
+    csv_df['open'] = csv_df['avg_temp']
+    csv_df['high'] = csv_df['avg_temp'] + 2
+    csv_df['low'] = csv_df['avg_temp'] - 2
+    
+    # Calculate HDD
+    csv_df['close'] = csv_df['avg_temp'].apply(lambda x: max(0, 18.33 - x)) # HDD
+    csv_df['volume'] = 0
+    
+    # Format time to ISO 8601 for CSV (T00:00:00Z)
+    csv_df['time'] = csv_df['time'].apply(lambda x: f"{x}T00:00:00Z")
+    
+    csv_df = csv_df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    csv_df.to_csv("US_AGGREGATE_NATGAS.csv", index=False)
+    print("Generated US_AGGREGATE_NATGAS.csv")
+
+    # B. Generate Pine Script Text
+    # Limit to last 365 days to respect Pine array limits
+    df_recent = df.tail(365)
+    
     hdds = []
     dates = []
     
-    for _, row in df.iterrows():
-        hdd = max(0, base_temp - row['avg_temp'])
-        # Convert date to Unix Timestamp (ms) for Pine
-        dt_obj = datetime.strptime(row['time'], '%Y-%m-%d')
-        unix_time = int(dt_obj.timestamp() * 1000)
+    for _, row in df_recent.iterrows():
+        hdd = max(0, 18.33 - row['avg_temp'])
+        # Convert YYYY-MM-DD to Unix Time (ms)
+        dt_obj = datetime.strptime(row['time'], "%Y-%m-%d")
+        unix_ms = int(dt_obj.timestamp() * 1000)
         
         hdds.append(str(round(hdd, 2)))
-        dates.append(str(unix_time))
+        dates.append(str(unix_ms))
 
-    # SPLIT DATA into chunks (Pine Script has a char limit per line)
-    # We will just take the last 365 days to be safe and efficient
-    hdds = hdds[-365:]
-    dates = dates[-365:]
-
-    pine_script = f"""
-// AUTO-GENERATED PINE SCRIPT
-// COPY BELOW THIS LINE
+    pine_content = f"""
+// --- PASTE INTO PINE EDITOR ---
+// Data Updated: {datetime.now().strftime('%Y-%m-%d')}
 var float[] hdd_data = array.from({', '.join(hdds)})
 var int[] time_data = array.from({', '.join(dates)})
 
@@ -84,20 +157,21 @@ var float current_hdd = na
 int time_ms = time
 int array_size = array.size(time_data)
 
-// Simple lookup (O(N) - optimized for recent data)
+// Simple O(N) lookup
+// (Pine Script works bar-by-bar, so we look for the matching date)
 for i = 0 to array_size - 1
     if array.get(time_data, i) == time_ms
         current_hdd := array.get(hdd_data, i)
         break
 
 plot(current_hdd, title="HDD Forecast", color=color.blue, style=plot.style_columns, linewidth=2)
-// COPY ABOVE THIS LINE
+// --- END PASTE ---
 """
     
     with open("pine_code.txt", "w") as f:
-        f.write(pine_script)
-    print("Successfully generated pine_code.txt")
+        f.write(pine_content)
+    print("Generated pine_code.txt")
 
 if __name__ == "__main__":
-    df = fetch_history_and_forecast()
-    generate_pine_code(df)
+    df = fetch_data()
+    generate_files(df)
