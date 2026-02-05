@@ -2,138 +2,102 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import os
-import sys
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("TOMORROW_API_KEY")
-FILE_NAME = "US_AGGREGATE_NATGAS.csv"
-HISTORY_START_YEAR = 2020
-
-# The "NatG 5" Weighted Basket
+HISTORY_START_YEAR = 2024 # Keep it shorter for hardcoded arrays (Script Char Limit)
 LOCATIONS = [
     {"name": "Chicago", "lat": 41.8781, "lon": -87.6298, "weight": 0.35},
     {"name": "New York", "lat": 40.7128, "lon": -74.0060, "weight": 0.30},
     {"name": "Denver",   "lat": 39.7392, "lon": -104.9903, "weight": 0.15},
     {"name": "Houston",  "lat": 29.7604, "lon": -95.3698,  "weight": 0.10},
-    {"name": "Atlanta",  "lat": 33.7490, "lon": -84.3880,  "weight": 0.10}
+    {"name": "Atlanta",  "lat": 33.7490", "lon": -84.3880,  "weight": 0.10}
 ]
 
-# --- PART 1: FETCH HISTORY (Open-Meteo - Free) ---
-def fetch_history_data():
-    print("Fetching Historical Data (Open-Meteo)...")
+def fetch_history_and_forecast():
+    # 1. Fetch History (Open-Meteo)
+    print("Fetching History...")
     end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     start_date = f"{HISTORY_START_YEAR}-01-01"
     
-    # We fetch all cities in one go if possible, but loop is safer for clarity
     history_frames = []
-    
     for loc in LOCATIONS:
         url = "https://archive-api.open-meteo.com/v1/archive"
-        params = {
-            "latitude": loc['lat'],
-            "longitude": loc['lon'],
-            "start_date": start_date,
-            "end_date": end_date,
-            "daily": "temperature_2m_mean",
-            "timezone": "UTC"
-        }
-        r = requests.get(url, params=params)
-        data = r.json()
-        
-        # Create DataFrame for this city
-        df = pd.DataFrame({
-            'time': data['daily']['time'],
-            'temp': data['daily']['temperature_2m_mean']
-        })
+        params = {"latitude": loc['lat'], "longitude": loc['lon'], "start_date": start_date, "end_date": end_date, "daily": "temperature_2m_mean"}
+        r = requests.get(url, params=params).json()
+        df = pd.DataFrame({'time': r['daily']['time'], 'temp': r['daily']['temperature_2m_mean']})
         df['weight'] = loc['weight']
         history_frames.append(df)
-        
-    # Combine and Calculate Weighted Avg for History
-    full_history = pd.concat(history_frames)
-    # Group by date and sum (Temp * Weight)
-    # Note: We need to normalize if any data is missing, but Open-Meteo is reliable.
-    full_history['weighted_temp'] = full_history['temp'] * full_history['weight']
     
-    daily_history = full_history.groupby('time')['weighted_temp'].sum().reset_index()
-    daily_history.rename(columns={'weighted_temp': 'avg_temp'}, inplace=True)
-    return daily_history
+    full_hist = pd.concat(history_frames)
+    daily_hist = full_hist.groupby('time').apply(lambda x: (x['temp'] * x['weight']).sum()).reset_index(name='avg_temp')
 
-# --- PART 2: FETCH FORECAST (Tomorrow.io - Premium) ---
-def fetch_forecast_data():
-    if not API_KEY:
-        print("Skipping Forecast (No API Key)")
-        return pd.DataFrame()
+    # 2. Fetch Forecast (Tomorrow.io)
+    print("Fetching Forecast...")
+    forecast_map = {}
+    if API_KEY:
+        for loc in LOCATIONS:
+            url = f"https://api.tomorrow.io/v4/weather/forecast?location={loc['lat']},{loc['lon']}&apikey={API_KEY}"
+            try:
+                data = requests.get(url).json()['timelines']['daily']
+                for d in data:
+                    dt = d['time'].split('T')[0]
+                    val = d['values']['temperatureAvg']
+                    forecast_map[dt] = forecast_map.get(dt, 0) + (val * loc['weight'])
+            except: pass
+    
+    daily_fore = pd.DataFrame(list(forecast_map.items()), columns=['time', 'avg_temp'])
+    
+    # 3. Merge
+    df_final = pd.concat([daily_hist, daily_fore]).drop_duplicates(subset='time', keep='last').sort_values('time')
+    
+    return df_final
 
-    print("Fetching Forecast Data (Tomorrow.io)...")
-    date_map = {}
+def generate_pine_code(df):
+    # Convert to HDD
+    base_temp = 18.33
+    hdds = []
+    dates = []
     
-    for loc in LOCATIONS:
-        url = f"https://api.tomorrow.io/v4/weather/forecast?location={loc['lat']},{loc['lon']}&apikey={API_KEY}"
-        headers = {"accept": "application/json"}
-        try:
-            r = requests.get(url, headers=headers)
-            r.raise_for_status()
-            daily = r.json()['timelines']['daily']
-            
-            for day in daily:
-                dt = day['time'].split('T')[0] # Keep strictly YYYY-MM-DD
-                temp = day['values'].get('temperatureAvg', 0)
-                
-                if dt not in date_map:
-                    date_map[dt] = 0
-                date_map[dt] += (temp * loc['weight'])
-                
-        except Exception as e:
-            print(f"Forecast Error for {loc['name']}: {e}")
+    for _, row in df.iterrows():
+        hdd = max(0, base_temp - row['avg_temp'])
+        # Convert date to Unix Timestamp (ms) for Pine
+        dt_obj = datetime.strptime(row['time'], '%Y-%m-%d')
+        unix_time = int(dt_obj.timestamp() * 1000)
+        
+        hdds.append(str(round(hdd, 2)))
+        dates.append(str(unix_time))
 
-    # Convert to DataFrame
-    forecast_rows = [{'time': k, 'avg_temp': v} for k, v in date_map.items()]
-    return pd.DataFrame(forecast_rows)
+    # SPLIT DATA into chunks (Pine Script has a char limit per line)
+    # We will just take the last 365 days to be safe and efficient
+    hdds = hdds[-365:]
+    dates = dates[-365:]
 
-# --- MAIN EXECUTION ---
-def run_full_cycle():
-    # 1. Get History
-    df_hist = fetch_history_data()
+    pine_script = f"""
+// AUTO-GENERATED PINE SCRIPT
+// COPY BELOW THIS LINE
+var float[] hdd_data = array.from({', '.join(hdds)})
+var int[] time_data = array.from({', '.join(dates)})
+
+// Align data to chart
+var float current_hdd = na
+int time_ms = time
+int array_size = array.size(time_data)
+
+// Simple lookup (O(N) - optimized for recent data)
+for i = 0 to array_size - 1
+    if array.get(time_data, i) == time_ms
+        current_hdd := array.get(hdd_data, i)
+        break
+
+plot(current_hdd, title="HDD Forecast", color=color.blue, style=plot.style_columns, linewidth=2)
+// COPY ABOVE THIS LINE
+"""
     
-    # 2. Get Forecast
-    df_fore = fetch_forecast_data()
-    
-    # 3. Merge (Forecast overrides History if dates overlap)
-    # Ensure both have 'time' as datetime for sorting
-    if not df_hist.empty:
-        df_hist['time'] = pd.to_datetime(df_hist['time'])
-    if not df_fore.empty:
-        df_fore['time'] = pd.to_datetime(df_fore['time'])
-        
-    # Concatenate
-    df_final = pd.concat([df_hist, df_fore]).drop_duplicates(subset='time', keep='last')
-    df_final.sort_values('time', inplace=True)
-    
-    # 4. Calculate HDD/CDD and Format
-    output_rows = []
-    base_temp_c = 18.33 # 65F
-    
-    for _, row in df_final.iterrows():
-        t = row['avg_temp']
-        hdd = max(0, base_temp_c - t)
-        cdd = max(0, t - base_temp_c)
-        
-        output_rows.append({
-            'time': row['time'].strftime('%Y-%m-%dT%H:%M:%SZ'), # TradingView Format
-            'open': round(t, 2),
-            'high': round(t + 2, 2),
-            'low': round(t - 2, 2),
-            'close': round(hdd, 2), # HDD is key
-            'volume': int(cdd * 10)
-        })
-        
-    # Save
-    final_df = pd.DataFrame(output_rows)
-    # Ensure correct column order
-    final_df = final_df[['time', 'open', 'high', 'low', 'close', 'volume']]
-    
-    final_df.to_csv(FILE_NAME, index=False)
-    print(f"SUCCESS: Generated {len(final_df)} days of data (2020-2026).")
+    with open("pine_code.txt", "w") as f:
+        f.write(pine_script)
+    print("Successfully generated pine_code.txt")
 
 if __name__ == "__main__":
-    run_full_cycle()
+    df = fetch_history_and_forecast()
+    generate_pine_code(df)
