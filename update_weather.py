@@ -6,15 +6,14 @@ import sys
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("TOMORROW_API_KEY")
-# CHANGED: Started from 2021 to capture the historic Volatility of that winter
 HISTORY_START_YEAR = 2021 
 
 LOCATIONS = [
     {"name": "Chicago", "lat": 41.8781, "lon": -87.6298, "weight": 0.35},
     {"name": "New York", "lat": 40.7128, "lon": -74.0060, "weight": 0.30},
-    {"name": "Denver",   "lat": 39.7392, "lon": -104.9903", "weight": 0.15},
+    {"name": "Denver",   "lat": 39.7392, "lon": -104.9903, "weight": 0.15}, # Fixed typo here
     {"name": "Houston",  "lat": 29.7604, "lon": -95.3698,  "weight": 0.10},
-    {"name": "Atlanta",  "lat": 33.7490", "lon": -84.3880,  "weight": 0.10}
+    {"name": "Atlanta",  "lat": 33.7490, "lon": -84.3880,  "weight": 0.10}
 ]
 
 def fetch_data():
@@ -28,7 +27,6 @@ def fetch_data():
     try:
         hist_frames = []
         for loc in LOCATIONS:
-            # Using Open-Meteo for deep history (Free & Fast)
             url = "https://archive-api.open-meteo.com/v1/archive"
             params = {
                 "latitude": loc['lat'], 
@@ -88,9 +86,6 @@ def fetch_data():
 def generate_files(df):
     if df.empty: return
 
-    # CHANGED: Removed the .tail(365) limit. 
-    # We now output the FULL dataset (2021-2026).
-    
     hdds = []
     dates = []
     
@@ -98,15 +93,13 @@ def generate_files(df):
         hdd = max(0, 18.33 - row['avg_temp'])
         dt_obj = datetime.strptime(row['time'], "%Y-%m-%d")
         unix_ms = int(dt_obj.timestamp() * 1000)
-        
-        # Rounding to save character space in the text file
         hdds.append(str(round(hdd, 2)))
         dates.append(str(unix_ms))
 
-    # We format the array string carefully to ensure it fits valid Pine syntax
+    # --- UPDATED TEMPLATE WITH AUTO-SCALING LOGIC ---
     pine_content = f"""// --- PASTE INTO PINE EDITOR ---
 // Data Range: {HISTORY_START_YEAR} to {datetime.now().strftime('%Y-%m-%d')}
-// Context: 5-Year History + 14-Day Forecast
+// Context: 5-Year History + 14-Day Forecast + AutoScaling
 var float[] hdd_data = array.from({', '.join(hdds)})
 var int[] time_data = array.from({', '.join(dates)})
 
@@ -114,33 +107,37 @@ var int[] time_data = array.from({', '.join(dates)})
 var float current_hdd = na
 int bar_time = time
 int array_len = array.size(time_data)
-int ms_in_day = 86400000
+
+// Auto-Scale: Calculate how many milliseconds are in *one bar* of your current chart
+int ms_per_bar = time - time[1]
 
 // 1. Historical Alignment
 for i = 0 to array_len - 1
     int t_data = array.get(time_data, i)
-    if math.abs(bar_time - t_data) < 43200000
+    // Fuzzy Match: Check if data fits in this bar's window
+    if math.abs(bar_time - t_data) < (ms_per_bar / 2)
         current_hdd := array.get(hdd_data, i)
         break
 
 plot(current_hdd, title="Historical HDD", color=color.blue, style=plot.style_columns, linewidth=2)
 
-// 2. Future Projection
+// 2. Future Projection (Auto-Scaled)
 if barstate.islast
     for i = 0 to array_len - 1
         int t_data = array.get(time_data, i)
         float hdd_val = array.get(hdd_data, i)
         if t_data > bar_time
-            int bars_forward = math.round((t_data - bar_time) / ms_in_day)
-            if bars_forward > 0
-                box.new(left=bar_index + bars_forward, top=hdd_val, bottom=0, right=bar_index + bars_forward, 
+            // Calculate bars forward based on CURRENT TIMEFRAME
+            int bars_fwd = math.round((t_data - bar_time) / ms_per_bar)
+            if bars_fwd > 0
+                box.new(left=bar_index + bars_fwd, top=hdd_val, bottom=0, right=bar_index + bars_fwd, 
                      bgcolor=color.new(color.orange, 20), border_color=color.orange, border_width=2)
 // --- END PASTE ---
 """
     
     with open("pine_code.txt", "w") as f:
         f.write(pine_content)
-    print("Generated pine_code.txt with full history")
+    print("Generated pine_code.txt with full history and auto-scaling")
 
 if __name__ == "__main__":
     df = fetch_data()
