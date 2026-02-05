@@ -1,0 +1,38 @@
+name: Update US Aggregate Weather
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs every 6 hours
+  workflow_dispatch:      # Allows you to click "Run Now" in GitHub Actions tab
+
+jobs:
+  update-weather-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # REQUIRED: Allows the bot to push the CSV back to the repo
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: pip install requests pandas
+
+      - name: Run Aggregate Script
+        env:
+          # This pulls the key from your GitHub Repo Settings -> Secrets
+          TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }} 
+        run: python update_weather.py
+
+      - name: Commit and Push Data
+        run: |
+          git config --global user.name 'NatGasBot'
+          git config --global user.email 'bot@noreply.github.com'
+          git add US_AGGREGATE_NATGAS.csv
+          # Only commit if data changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update NatGas HDD Forecast" && git push)
