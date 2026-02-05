@@ -6,7 +6,6 @@ import sys
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("TOMORROW_API_KEY")
-# Using a shorter history for the text file to fit in Pine's character limit
 HISTORY_START_YEAR = 2024 
 
 LOCATIONS = [
@@ -38,7 +37,6 @@ def fetch_data():
                 "end_date": end_date, 
                 "daily": "temperature_2m_mean"
             }
-            # Add timeout to prevent hanging
             r = requests.get(url, params=params, timeout=10)
             data = r.json()
             
@@ -73,7 +71,7 @@ def fetch_data():
                 if r.status_code == 200:
                     timelines = r.json().get('timelines', {}).get('daily', [])
                     for day in timelines:
-                        # CRITICAL: Normalize time to YYYY-MM-DD to avoid duplicates
+                        # CRITICAL FIX: Normalize time to YYYY-MM-DD to avoid duplicates
                         dt = day['time'].split('T')[0]
                         temp = day['values'].get('temperatureAvg', 0)
                         
@@ -86,8 +84,6 @@ def fetch_data():
                 print(f"Forecast fetched: {len(daily_fore)} days.")
         except Exception as e:
             print(f"Forecast Fetch Error: {e}")
-    else:
-        print("Skipping Forecast (No API Key).")
 
     # 3. MERGE & CLEAN
     df_final = pd.DataFrame()
@@ -99,7 +95,7 @@ def fetch_data():
         df_final = daily_fore
 
     if not df_final.empty:
-        # STRICT DEDUPLICATION: Drop duplicates, keeping the last (Forecast overrides History)
+        # STRICT DEDUPLICATION: This line fixes the CSV error
         df_final = df_final.drop_duplicates(subset='time', keep='last')
         df_final = df_final.sort_values('time')
     
@@ -108,32 +104,27 @@ def fetch_data():
 def generate_files(df):
     if df.empty:
         print("No data to write.")
-        # Create empty file so Git doesn't fail
-        with open("pine_code.txt", "w") as f: f.write("// No Data Available")
+        # Create empty dummy files so Git doesn't crash
+        with open("pine_code.txt", "w") as f: f.write("// No Data")
         return
 
-    # A. Generate CSV (Fixed Format)
-    # We create dummy OHLC columns for the Seed CSV
+    # A. Generate CSV (For Seed)
     csv_df = df.copy()
     csv_df['open'] = csv_df['avg_temp']
     csv_df['high'] = csv_df['avg_temp'] + 2
     csv_df['low'] = csv_df['avg_temp'] - 2
-    
-    # Calculate HDD
     csv_df['close'] = csv_df['avg_temp'].apply(lambda x: max(0, 18.33 - x)) # HDD
     csv_df['volume'] = 0
     
-    # Format time to ISO 8601 for CSV (T00:00:00Z)
+    # Fix Time Format for TradingView CSV (Must be ISO)
     csv_df['time'] = csv_df['time'].apply(lambda x: f"{x}T00:00:00Z")
     
     csv_df = csv_df[['time', 'open', 'high', 'low', 'close', 'volume']]
     csv_df.to_csv("US_AGGREGATE_NATGAS.csv", index=False)
     print("Generated US_AGGREGATE_NATGAS.csv")
 
-    # B. Generate Pine Script Text
-    # Limit to last 365 days to respect Pine array limits
-    df_recent = df.tail(365)
-    
+    # B. Generate Pine Script Text (For Manual Paste)
+    df_recent = df.tail(365) # Keep last 365 days
     hdds = []
     dates = []
     
@@ -142,23 +133,18 @@ def generate_files(df):
         # Convert YYYY-MM-DD to Unix Time (ms)
         dt_obj = datetime.strptime(row['time'], "%Y-%m-%d")
         unix_ms = int(dt_obj.timestamp() * 1000)
-        
         hdds.append(str(round(hdd, 2)))
         dates.append(str(unix_ms))
 
-    pine_content = f"""
-// --- PASTE INTO PINE EDITOR ---
-// Data Updated: {datetime.now().strftime('%Y-%m-%d')}
+    pine_content = f"""// --- PASTE INTO PINE EDITOR ---
+// Last Update: {datetime.now().strftime('%Y-%m-%d')}
 var float[] hdd_data = array.from({', '.join(hdds)})
 var int[] time_data = array.from({', '.join(dates)})
 
-// Align data to chart
 var float current_hdd = na
 int time_ms = time
 int array_size = array.size(time_data)
 
-// Simple O(N) lookup
-// (Pine Script works bar-by-bar, so we look for the matching date)
 for i = 0 to array_size - 1
     if array.get(time_data, i) == time_ms
         current_hdd := array.get(hdd_data, i)
