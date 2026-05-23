@@ -1,8 +1,8 @@
 // --- PASTE INTO PINE EDITOR ---
 // Data Range: 2021 to 2026-05-23
 // Context: 5-Year History + 14-Day Forecast + AutoScaling
-var float[] hdd_data = array.from(4.39, 2.65, 0.47, 0, 0, 0, 0)
-var int[] time_data = array.from(1779408000000, 1779494400000, 1779580800000, 1779667200000, 1779753600000, 1779840000000, 1779926400000)
+var float[] hdd_data = array.from(3.14, 3.22, 0, 0, 0, 0)
+var int[] time_data = array.from(1779494400000, 1779580800000, 1779667200000, 1779753600000, 1779840000000, 1779926400000)
 
 // --- RENDERING LOGIC ---
 var float current_hdd = na
